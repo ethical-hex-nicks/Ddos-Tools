@@ -19,8 +19,8 @@ var proxies = proxyRaw.filter(function (l) { return l.includes(':'); });
 var url = new URL(target);
 
 var PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-var MAX_CONNS = 500;
-var MAX_STREAMS = 400;          
+var MAX_CONNS = 1200;
+var MAX_STREAMS = 900;          
 var PADDED_PREFIX = Buffer.from([0x80, 0, 0, 0, 0xFF]);
 var proxyIdx = 0;
 var CONNS_PER_PROXY = 2;        
